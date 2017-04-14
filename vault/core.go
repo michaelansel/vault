@@ -19,6 +19,8 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
+	gov "github.com/hashicorp/go-version"
+
 	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
@@ -31,6 +33,7 @@ import (
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/physical"
 	"github.com/hashicorp/vault/shamir"
+	"github.com/hashicorp/vault/version"
 )
 
 const (
@@ -45,6 +48,11 @@ const (
 	// coreLeaderPrefix is the prefix used for the UUID that contains
 	// the currently elected leader.
 	coreLeaderPrefix = "core/leader/"
+
+	// coreDataVersionPath stores the highest version of Vault to unseal; if an
+	// earlier version tries to unseal it will fail, requiring this key to be
+	// deleted first
+	coreDataVersionPath = "core/data-version"
 
 	// lockRetryInterval is the interval we re-attempt to acquire the
 	// HA lock if an error is encountered
@@ -907,6 +915,60 @@ func (c *Core) unsealInternal(masterKey []byte) (bool, error) {
 	}
 	if c.logger.IsInfo() {
 		c.logger.Info("core: vault is unsealed")
+	}
+
+	// check version to make sure a downgrade hasn't happened
+	ver, err := c.barrier.Get(coreDataVersionPath)
+	if err != nil {
+		c.logger.Error("core: data version check failed", "error", err)
+		c.barrier.Seal()
+		c.logger.Warn("core: vault is sealed")
+		return false, err
+	}
+
+	persistVersion := false
+
+	localVer, err := gov.NewVersion(version.GetVersion().VersionNumber())
+	if err != nil {
+		// Don't do anything; this could be an unknown case such as during
+		// tests; we also don't want to persist the local version if we can't
+		// parse it
+		c.logger.Warn("core: could not perform data version check", "local_version", version.GetVersion().VersionNumber())
+		goto VERSION_DONE
+	}
+
+	if ver == nil {
+		persistVersion = true
+	} else {
+		dataVer, err := gov.NewVersion(string(ver.Value))
+		if err != nil {
+			c.logger.Warn("core: could not perform data version check", "saved_version", string(ver.Value))
+			goto VERSION_DONE
+		}
+		if localVer.LessThan(dataVer) {
+			c.logger.Error("core: downgrade detected and not supported, re-sealing")
+			c.barrier.Seal()
+			c.logger.Warn("core: vault is sealed")
+			return false, fmt.Errorf("downgrade detected and not supported; to proceed anyways delete %q and unseal Vault again", coreDataVersionPath)
+		}
+		if localVer.GreaterThan(dataVer) {
+			persistVersion = true
+		}
+	}
+
+VERSION_DONE:
+	if persistVersion {
+		ver = &Entry{
+			Key:   coreDataVersionPath,
+			Value: []byte(version.GetVersion().VersionNumber()),
+		}
+		err = c.barrier.Put(ver)
+		if err != nil {
+			c.logger.Error("core: error saving data version")
+			c.barrier.Seal()
+			c.logger.Warn("core: vault is sealed")
+			return false, err
+		}
 	}
 
 	// Do post-unseal setup if HA is not enabled
